@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +62,7 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		conn: conn,
 	}
 	s.tunnel.Store(tunnel)
+	slog.Info("tunnel connected", "from", conn.RemoteAddr().String())
 
 	// keep alive ping-pong
 	go func() {
@@ -87,12 +89,17 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		switch frame.Type {
 		case protocol.TypeStreamData:
 			if conn, ok := s.tunnel.Load().streams.Load(frame.StreamID); ok {
+				slog.Debug("forwarding data", "streamID", frame.StreamID, "len", len(frame.Payload))
 				conn.(net.Conn).Write(frame.Payload)
+			} else {
+				slog.Warn("received data for unknown stream", "streamID", frame.StreamID)
 			}
 		case protocol.TypeStreamClose:
 			if conn, ok := s.tunnel.Load().streams.LoadAndDelete(frame.StreamID); ok {
 				conn.(net.Conn).Close()
 			}
+		case protocol.TypePong:
+			slog.Debug("received pong")
 		}
 	}
 }
@@ -158,6 +165,7 @@ func (s *Server) handlePublic(conn net.Conn) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buf)
+		slog.Info("read from public", "len", n)
 		if n > 0 {
 			wErr := tunnel.Write(protocol.Frame{
 				Type:     protocol.TypeStreamData,
@@ -180,9 +188,13 @@ func (s *Server) handlePublic(conn net.Conn) {
 }
 
 func main() {
-	publicAddr := flag.String("public", "", "public listener address")
-	tunnelAddr := flag.String("tunnel", "", "tunnel listener address")
+	publicAddr := flag.String("public", ":8080", "public listener address")
+	tunnelAddr := flag.String("tunnel", ":8443", "tunnel listener address")
 	flag.Parse()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
 
 	server := &Server{
 		publicAddr: *publicAddr,

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -46,14 +47,19 @@ func (c *Client) run() error {
 		}
 
 		switch frame.Type {
-		case protocol.TypeStreamOpen:
-			go c.handleStream(frame.StreamID)
 		case protocol.TypeStreamData:
 			// forward payload to destination server
-			if conn, ok := c.streams.Load(frame.StreamID); ok {
-				conn.(net.Conn).Write(frame.Payload)
+			conn, ok := c.streams.Load(frame.StreamID)
+			if !ok {
+				conn, err = c.openStream(frame.StreamID)
+				if err != nil {
+					return errors.Wrapf(err, "open stream %d", frame.StreamID)
+				}
 			}
+			slog.Debug("forwarding data", "streamID", frame.StreamID, "len", len(frame.Payload))
+			conn.(net.Conn).Write(frame.Payload)
 		case protocol.TypePing:
+			slog.Debug("received ping")
 			c.Write(protocol.Frame{
 				Type:     protocol.TypePong,
 				StreamID: frame.StreamID,
@@ -66,59 +72,67 @@ func (c *Client) run() error {
 	}
 }
 
-func (c *Client) handleStream(streamID uint32) {
+func (c *Client) openStream(streamID uint32) (net.Conn, error) {
 	log := slog.With("streamID", streamID)
-	defer func() {
-		log.Info("closing stream")
-		err := c.Write(protocol.Frame{
-			Type:     protocol.TypeStreamClose,
-			StreamID: streamID,
-		})
-		if err != nil {
-			log.Error("write stream close", "err", err)
-		}
-	}()
 
 	dest, err := net.Dial("tcp", c.destAddr)
 	if err != nil {
-		log.Error("dial dest", "err", err)
-		return
+		return nil, errors.Wrap(err, "dial dest")
 	}
-	defer dest.Close()
 
 	c.streams.Store(streamID, dest)
-	defer c.streams.Delete(streamID)
-
 	log.Info("opened new stream")
 
-	// read from the connection to dest and forward it to the Server
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := dest.Read(buf)
-		if n > 0 {
-			wErr := c.Write(protocol.Frame{
-				Type:     protocol.TypeStreamData,
+	go func() {
+		defer func() {
+			log.Info("closing stream")
+			err := c.Write(protocol.Frame{
+				Type:     protocol.TypeStreamClose,
 				StreamID: streamID,
-				Payload:  buf[:n],
 			})
-			if wErr != nil {
-				log.Error("write to server", "err", wErr)
+			if err != nil {
+				log.Error("write stream close", "err", err)
 			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				log.Error("read from dest", "err", err)
-			}
+			c.streams.Delete(streamID)
+			dest.Close()
+		}()
 
-			return
+		// read from the connection to dest and forward it to the Server
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := dest.Read(buf)
+			log.Info("read from dest", "len", n)
+			if n > 0 {
+				wErr := c.Write(protocol.Frame{
+					Type:     protocol.TypeStreamData,
+					StreamID: streamID,
+					Payload:  buf[:n],
+				})
+				if wErr != nil {
+					log.Error("write to server", "err", wErr)
+				}
+			}
+			if err != nil {
+				if err != io.EOF {
+					log.Error("read from dest", "err", err)
+				}
+
+				return
+			}
 		}
-	}
+	}()
+
+	return dest, nil
 }
 
 func main() {
-	serverAddr := flag.String("server", "localhost:8443", "tunnel server address")
-	destAddr := flag.String("destination", "localhost:80", "destination service address")
+	serverAddr := flag.String("server", ":8443", "tunnel server address")
+	destAddr := flag.String("destination", ":42064", "destination service address")
 	flag.Parse()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
 
 	client := Client{
 		serverAddr: *serverAddr,
