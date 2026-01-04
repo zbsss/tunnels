@@ -65,6 +65,7 @@ func (s *Server) handleTunnel(conn net.Conn) {
 	slog.Info("tunnel connected", "from", conn.RemoteAddr().String())
 
 	// keep alive ping-pong
+	// TODO: this Go routine needs to be stopped if tunnel connection is lost
 	go func() {
 		for range time.Tick(30 * time.Second) {
 			err := tunnel.Write(protocol.Frame{
@@ -165,8 +166,8 @@ func (s *Server) handlePublic(conn net.Conn) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buf)
-		slog.Info("read from public", "len", n)
 		if n > 0 {
+			slog.Debug("read from public", "len", n)
 			wErr := tunnel.Write(protocol.Frame{
 				Type:     protocol.TypeStreamData,
 				StreamID: streamID,
@@ -188,12 +189,17 @@ func (s *Server) handlePublic(conn net.Conn) {
 }
 
 func main() {
+	debug := flag.Bool("debug", true, "enable debug logging")
 	publicAddr := flag.String("public", ":8080", "public listener address")
 	tunnelAddr := flag.String("tunnel", ":8443", "tunnel listener address")
 	flag.Parse()
 
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level: level,
 	})))
 
 	server := &Server{
@@ -208,4 +214,6 @@ func main() {
 
 	go server.listenTunnel()
 	server.listenPublic()
+
+	// TODO: handle graceful shutdowns
 }

@@ -149,12 +149,17 @@ func (c *Client) openStream(streamID uint32) (*Stream, error) {
 }
 
 func main() {
+	debug := flag.Bool("debug", true, "enable debug logging")
 	serverAddr := flag.String("server", ":8443", "tunnel server address")
 	destAddr := flag.String("destination", ":42064", "destination service address")
 	flag.Parse()
 
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level: level,
 	})))
 
 	client := Client{
