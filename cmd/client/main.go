@@ -48,7 +48,10 @@ func (c *Client) run() error {
 				}
 			}
 			slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-			stream.(*protocol.Stream).Write(frame.Payload)
+			_, err := stream.(*protocol.Stream).Write(frame.Payload)
+			if err != nil {
+				slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
+			}
 		case protocol.TypePing:
 			slog.Debug("received ping")
 			c.tunnel.Write(protocol.Frame{

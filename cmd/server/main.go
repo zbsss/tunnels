@@ -90,7 +90,10 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		case protocol.TypeStreamData:
 			if conn, ok := s.streams.Load(frame.StreamID); ok {
 				slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-				conn.(net.Conn).Write(frame.Payload)
+				_, err := conn.(*protocol.Stream).Write(frame.Payload)
+				if err != nil {
+					slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
+				}
 			} else {
 				slog.Warn("received data for unknown stream", "streamID", frame.StreamID)
 			}

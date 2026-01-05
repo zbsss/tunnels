@@ -51,8 +51,14 @@ func (s *Stream) Close() error {
 	if s.isClosed.Load() {
 		return nil
 	}
+
+	err := s.Conn.Close()
+	if err != nil {
+		return err
+	}
+
 	s.isClosed.Store(true)
-	return s.Close()
+	return nil
 }
 
 func (s *Stream) IsClosed() bool {
