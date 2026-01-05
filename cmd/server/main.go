@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -14,28 +15,15 @@ import (
 	"github.com/zbsss/tunnels/pkg/protocol"
 )
 
-type Tunnel struct {
-	mu sync.Mutex
-
-	// connection to the Client
-	conn net.Conn
-
-	// map from StreamID to Public net.Conn
-	streams sync.Map
-}
-
-func (t *Tunnel) Write(frame protocol.Frame) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return protocol.WriteFrame(t.conn, frame)
-}
-
 type Server struct {
 	publicAddr string
 	tunnelAddr string
 
-	nextStreamID atomic.Uint32
-	tunnel       atomic.Pointer[Tunnel]
+	prevStreamID atomic.Uint32
+	tunnel       atomic.Pointer[protocol.Tunnel]
+
+	// map from StreamID to protocol.Stream
+	streams sync.Map
 }
 
 func (s *Server) listenTunnel() {
@@ -58,23 +46,27 @@ func (s *Server) listenTunnel() {
 }
 
 func (s *Server) handleTunnel(conn net.Conn) {
-	tunnel := &Tunnel{
-		conn: conn,
-	}
+	tunnel := protocol.NewTunnel(conn)
 	s.tunnel.Store(tunnel)
 	slog.Info("tunnel connected", "from", conn.RemoteAddr().String())
 
 	// keep alive ping-pong
-	// TODO: this Go routine needs to be stopped if tunnel connection is lost
+	done := make(chan struct{})
 	go func() {
-		for range time.Tick(30 * time.Second) {
-			err := tunnel.Write(protocol.Frame{
-				Type:     protocol.TypePing,
-				StreamID: 0,
-			})
-			if err != nil {
-				slog.Error("write ping", "err", err)
-				continue
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(30 * time.Second):
+				slog.Debug("sending ping")
+				err := tunnel.Write(protocol.Frame{
+					Type:     protocol.TypePing,
+					StreamID: 0,
+				})
+				if err != nil {
+					slog.Error("write ping", "err", err)
+					continue
+				}
 			}
 		}
 	}()
@@ -82,22 +74,33 @@ func (s *Server) handleTunnel(conn net.Conn) {
 	for {
 		frame, err := protocol.ReadFrame(conn)
 		if err != nil {
-			slog.Error("read from tunnel", "err", err)
+			if !errors.Is(err, io.EOF) {
+				slog.Error("read from tunnel", "err", err)
+			}
+
 			s.tunnel.Store(nil)
+			// TODO: if there are open streams should we close them?
+
+			close(done)
+			slog.Info("tunnel disconnected")
 			return
 		}
 
 		switch frame.Type {
 		case protocol.TypeStreamData:
-			if conn, ok := s.tunnel.Load().streams.Load(frame.StreamID); ok {
-				slog.Debug("forwarding data", "streamID", frame.StreamID, "len", len(frame.Payload))
+			if conn, ok := s.streams.Load(frame.StreamID); ok {
+				slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
 				conn.(net.Conn).Write(frame.Payload)
 			} else {
 				slog.Warn("received data for unknown stream", "streamID", frame.StreamID)
 			}
 		case protocol.TypeStreamClose:
-			if conn, ok := s.tunnel.Load().streams.LoadAndDelete(frame.StreamID); ok {
-				conn.(net.Conn).Close()
+			if st, ok := s.streams.LoadAndDelete(frame.StreamID); ok {
+				slog.Debug("received StreamClose, closing stream...", "streamID", frame.StreamID)
+				stream := st.(*protocol.Stream)
+				if err := stream.Close(); err != nil {
+					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
+				}
 			}
 		case protocol.TypePong:
 			slog.Debug("received pong")
@@ -133,59 +136,14 @@ func (s *Server) handlePublic(conn net.Conn) {
 		return
 	}
 
-	streamID := s.nextStreamID.Add(1)
-	s.tunnel.Load().streams.Store(streamID, conn)
-	defer s.tunnel.Load().streams.Delete(streamID)
+	stream := protocol.NewStream(s.prevStreamID.Add(1), conn)
+	s.streams.Store(stream.ID, stream)
+	defer s.streams.Delete(stream.ID)
 
-	log := slog.With("streamID", streamID)
-
-	// Send StreamOpen
-	err := tunnel.Write(protocol.Frame{
-		Type:     protocol.TypeStreamOpen,
-		StreamID: streamID,
-	})
-	if err != nil {
-		log.Error("write stream open", "err", err)
-		return
-	}
+	log := slog.With("streamID", stream.ID)
 	log.Info("opened new stream")
 
-	// Send StreamClose
-	defer func() {
-		log.Info("closing stream")
-		err = tunnel.Write(protocol.Frame{
-			Type:     protocol.TypeStreamClose,
-			StreamID: streamID,
-		})
-		if err != nil {
-			log.Error("write stream close", "err", err)
-		}
-	}()
-
-	// Read 32KB chunk of the payload, create a frame and send it via Tunnel
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			slog.Debug("read from public", "len", n)
-			wErr := tunnel.Write(protocol.Frame{
-				Type:     protocol.TypeStreamData,
-				StreamID: streamID,
-				Payload:  buf[:n],
-			})
-			if wErr != nil {
-				log.Error("write stream data", "err", wErr)
-			}
-		}
-
-		if err != nil {
-			if err != io.EOF {
-				log.Error("read from public", "err", err)
-			}
-
-			return
-		}
-	}
+	protocol.ForwardToTunnel(stream, tunnel)
 }
 
 func main() {

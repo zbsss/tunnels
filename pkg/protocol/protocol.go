@@ -8,7 +8,6 @@ import (
 )
 
 const (
-	TypeStreamOpen  = 'o'
 	TypeStreamData  = 'd'
 	TypeStreamClose = 'c'
 	TypePing        = 'i'

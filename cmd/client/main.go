@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"flag"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -14,40 +12,27 @@ import (
 	"github.com/zbsss/tunnels/pkg/protocol"
 )
 
-type Stream struct {
-	conn   net.Conn
-	cancel context.CancelFunc
-}
-
 type Client struct {
 	serverAddr string
 	destAddr   string
 
-	mu   sync.Mutex
-	conn net.Conn
+	tunnel *protocol.Tunnel
 
 	streams sync.Map
 }
 
-func (c *Client) Write(frame protocol.Frame) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return protocol.WriteFrame(c.conn, frame)
-}
-
 func (c *Client) run() error {
-	tunnel, err := net.Dial("tcp", c.serverAddr)
+	conn, err := net.Dial("tcp", c.serverAddr)
 	if err != nil {
 		return errors.Wrap(err, "dial tunnel")
 	}
-
-	c.conn = tunnel
-	defer tunnel.Close()
+	defer conn.Close()
+	c.tunnel = protocol.NewTunnel(conn)
 
 	slog.Info("forwarding ready", "from", c.serverAddr, "to", c.destAddr)
 
 	for {
-		frame, err := protocol.ReadFrame(tunnel)
+		frame, err := protocol.ReadFrame(conn)
 		if err != nil {
 			return errors.Wrap(err, "read from tunnel")
 		}
@@ -62,87 +47,41 @@ func (c *Client) run() error {
 					return errors.Wrapf(err, "open stream %d", frame.StreamID)
 				}
 			}
-			slog.Debug("forwarding data", "streamID", frame.StreamID, "len", len(frame.Payload))
-			stream.(*Stream).conn.Write(frame.Payload)
+			slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
+			stream.(*protocol.Stream).Write(frame.Payload)
 		case protocol.TypePing:
 			slog.Debug("received ping")
-			c.Write(protocol.Frame{
+			c.tunnel.Write(protocol.Frame{
 				Type:     protocol.TypePong,
 				StreamID: frame.StreamID,
 			})
 		case protocol.TypeStreamClose:
 			if st, ok := c.streams.LoadAndDelete(frame.StreamID); ok {
 				slog.Debug("received StreamClose, closing stream...", "streamID", frame.StreamID)
-				stream := st.(*Stream)
-				stream.cancel()
-				if err := stream.conn.Close(); err != nil {
-					slog.Error("close dest connection", "streamID", frame.StreamID, "err", err)
+				stream := st.(*protocol.Stream)
+				if err := stream.Close(); err != nil {
+					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
 				}
 			}
 		}
 	}
 }
 
-func (c *Client) openStream(streamID uint32) (*Stream, error) {
+func (c *Client) openStream(streamID uint32) (*protocol.Stream, error) {
 	log := slog.With("streamID", streamID)
 
-	dest, err := net.Dial("tcp", c.destAddr)
+	destConn, err := net.Dial("tcp", c.destAddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "dial dest")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	stream := &Stream{
-		conn:   dest,
-		cancel: cancel,
-	}
+	stream := protocol.NewStream(streamID, destConn)
 	c.streams.Store(streamID, stream)
 	log.Info("opened new stream")
 
 	go func() {
-		// read from the connection to dest and forward it to the Server
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := dest.Read(buf)
-			if n > 0 {
-				log.Debug("read from dest", "len", n)
-				wErr := c.Write(protocol.Frame{
-					Type:     protocol.TypeStreamData,
-					StreamID: streamID,
-					Payload:  buf[:n],
-				})
-				if wErr != nil {
-					log.Error("write to server", "err", wErr)
-				}
-			}
-			if err != nil {
-				if ctx.Err() != nil {
-					log.Debug("stream closed by tunnel server")
-					return
-				}
-
-				if err != io.EOF {
-					log.Error("read from dest", "err", err)
-				}
-
-				log.Info("closing stream")
-				c.streams.Delete(streamID)
-				err := dest.Close()
-				if err != nil {
-					log.Error("close dest", "err", err)
-				}
-
-				err = c.Write(protocol.Frame{
-					Type:     protocol.TypeStreamClose,
-					StreamID: streamID,
-				})
-				if err != nil {
-					log.Error("write stream close", "err", err)
-				}
-
-				return
-			}
-		}
+		protocol.ForwardToTunnel(stream, c.tunnel)
+		c.streams.Delete(streamID)
 	}()
 
 	return stream, nil
@@ -173,6 +112,4 @@ func main() {
 			time.Sleep(5 * time.Second)
 		}
 	}
-
-	// TODO: handle graceful shutdown, close all streams
 }
