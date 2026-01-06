@@ -75,7 +75,7 @@ func (a *Agent) openBackendChannel(channelID uint32) (*transport.Channel, error)
 	}
 
 	channel := transport.NewChannel(channelID, backendConn)
-	a.tunnel.RegisterChannel(channelID, channel)
+	a.tunnel.RegisterChannel(channel)
 
 	channelLog := slog.With("component", "channel", "channelID", channelID, "backendAddr", a.backendAddr)
 	channelLog.Info("channel opened to backend")

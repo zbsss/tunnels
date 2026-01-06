@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,8 +20,54 @@ type Proxy struct {
 	publicAddr string
 	tunnelAddr string
 
-	prevChannelID atomic.Uint32
-	tunnel        atomic.Pointer[transport.Tunnel]
+	mu      sync.Mutex
+	tunnels []*transport.Tunnel
+	// used to generate unique channel IDs per tunnel
+	tunnelCounters map[*transport.Tunnel]*atomic.Uint32
+	// used to pick the next tunnel in round-robin fashion
+	nextTunnelIdx int
+}
+
+func (p *Proxy) nextTunnel() *transport.Tunnel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.tunnels) == 0 {
+		return nil
+	}
+
+	idx := (p.nextTunnelIdx + 1) % len(p.tunnels)
+	p.nextTunnelIdx = idx
+	return p.tunnels[idx]
+}
+
+func (p *Proxy) addTunnel(t *transport.Tunnel) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tunnels = append(p.tunnels, t)
+	p.tunnelCounters[t] = new(atomic.Uint32)
+}
+
+func (p *Proxy) removeTunnel(t *transport.Tunnel) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i := slices.Index(p.tunnels, t); i != -1 {
+		p.tunnels = slices.Delete(p.tunnels, i, i+1)
+	}
+	delete(p.tunnelCounters, t)
+}
+
+func (p *Proxy) nextChannelID(t *transport.Tunnel) uint32 {
+	p.mu.Lock()
+	counter, ok := p.tunnelCounters[t]
+	p.mu.Unlock()
+
+	if !ok {
+		// this shouldn't happen
+		panic("tunnel not found in counters map")
+	}
+
+	return counter.Add(1)
 }
 
 func (p *Proxy) listenTunnel() {
@@ -46,11 +94,11 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 	log := slog.With("component", "tunnel", "agentAddr", conn.RemoteAddr().String())
 
 	tunnel := transport.NewTunnel(conn)
-	p.tunnel.Store(tunnel)
+	p.addTunnel(tunnel)
 	log.Info("tunnel established")
 
 	defer func() {
-		p.tunnel.Store(nil)
+		p.removeTunnel(tunnel)
 		tunnel.Close()
 		log.Info("tunnel closed")
 	}()
@@ -126,15 +174,16 @@ func (p *Proxy) listenPublic() {
 }
 
 func (p *Proxy) handlePublicConnection(conn net.Conn) {
-	tunnel := p.tunnel.Load()
+	tunnel := p.nextTunnel()
 	if tunnel == nil {
 		slog.Warn("rejected connection, no tunnel available", "clientAddr", conn.RemoteAddr().String())
 		conn.Close()
 		return
 	}
 
-	channel := transport.NewChannel(p.prevChannelID.Add(1), conn)
-	tunnel.RegisterChannel(channel.ID, channel)
+	channelID := p.nextChannelID(tunnel)
+	channel := transport.NewChannel(channelID, conn)
+	tunnel.RegisterChannel(channel)
 
 	log := slog.With("component", "channel", "channelID", channel.ID, "clientAddr", conn.RemoteAddr().String())
 	log.Info("channel opened for public connection")
@@ -156,8 +205,9 @@ func main() {
 	})))
 
 	proxy := &Proxy{
-		publicAddr: *publicAddr,
-		tunnelAddr: *tunnelAddr,
+		publicAddr:     *publicAddr,
+		tunnelAddr:     *tunnelAddr,
+		tunnelCounters: make(map[*transport.Tunnel]*atomic.Uint32),
 	}
 
 	// Proxy must accept two types of connections

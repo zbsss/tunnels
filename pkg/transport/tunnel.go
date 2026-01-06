@@ -52,8 +52,8 @@ func (t *Tunnel) Close() error {
 }
 
 // RegisterChannel adds a channel to the tunnel's channel map
-func (t *Tunnel) RegisterChannel(id uint32, channel *Channel) {
-	t.channels.Store(id, channel)
+func (t *Tunnel) RegisterChannel(channel *Channel) {
+	t.channels.Store(channel.ID, channel)
 }
 
 // UnregisterChannel atomically removes and returns a channel from the tunnel
