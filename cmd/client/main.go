@@ -8,14 +8,14 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/zbsss/tunnels/pkg/protocol"
+	"github.com/zbsss/tunnels/pkg/transport"
 )
 
 type Client struct {
 	serverAddr string
 	destAddr   string
 
-	tunnel *protocol.Tunnel
+	tunnel *transport.Tunnel
 }
 
 func (c *Client) run() error {
@@ -23,7 +23,7 @@ func (c *Client) run() error {
 	if err != nil {
 		return errors.Wrap(err, "dial tunnel")
 	}
-	c.tunnel = protocol.NewTunnel(conn)
+	c.tunnel = transport.NewTunnel(conn)
 
 	log := slog.With("tunnelRemote", conn.RemoteAddr().String())
 	log.Info("tunnel connected")
@@ -34,13 +34,13 @@ func (c *Client) run() error {
 	}()
 
 	for {
-		frame, err := protocol.ReadFrame(conn)
+		frame, err := transport.ReadFrame(conn)
 		if err != nil {
 			return errors.Wrap(err, "read from tunnel")
 		}
 
 		switch frame.Type {
-		case protocol.TypeChannelData:
+		case transport.TypeChannelData:
 			// forward payload to destination server
 			channel, ok := c.tunnel.Channel(frame.ChannelID)
 			if !ok {
@@ -53,12 +53,12 @@ func (c *Client) run() error {
 			if _, err := channel.Conn.Write(frame.Payload); err != nil {
 				log.Error("write to channel", "channelID", frame.ChannelID, "err", err)
 			}
-		case protocol.TypePing:
+		case transport.TypePing:
 			log.Debug("received ping")
 			if err := c.tunnel.SendPong(); err != nil {
 				log.Error("write pong", "err", err)
 			}
-		case protocol.TypeChannelClose:
+		case transport.TypeChannelClose:
 			if channel, ok := c.tunnel.UnregisterChannel(frame.ChannelID); ok {
 				log.Info("received ChannelClose, closing channel", "channelID", frame.ChannelID)
 				if err := channel.Conn.Close(); err != nil {
@@ -69,13 +69,13 @@ func (c *Client) run() error {
 	}
 }
 
-func (c *Client) openBackendChannel(channelID uint32) (*protocol.Channel, error) {
+func (c *Client) openBackendChannel(channelID uint32) (*transport.Channel, error) {
 	backendConn, err := net.Dial("tcp", c.destAddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "dial dest")
 	}
 
-	channel := protocol.NewChannel(channelID, backendConn)
+	channel := transport.NewChannel(channelID, backendConn)
 	c.tunnel.RegisterChannel(channelID, channel)
 	slog.Info("opened new channel", "channelID", channelID, "to", backendConn.RemoteAddr().String())
 

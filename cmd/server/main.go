@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zbsss/tunnels/pkg/protocol"
+	"github.com/zbsss/tunnels/pkg/transport"
 )
 
 type Server struct {
@@ -19,7 +19,7 @@ type Server struct {
 	tunnelAddr string
 
 	prevChannelID atomic.Uint32
-	tunnel        atomic.Pointer[protocol.Tunnel]
+	tunnel        atomic.Pointer[transport.Tunnel]
 }
 
 func (s *Server) listenTunnel() {
@@ -44,7 +44,7 @@ func (s *Server) listenTunnel() {
 func (s *Server) handleTunnel(conn net.Conn) {
 	log := slog.With("tunnelRemote", conn.RemoteAddr().String())
 
-	tunnel := protocol.NewTunnel(conn)
+	tunnel := transport.NewTunnel(conn)
 	s.tunnel.Store(tunnel)
 	log.Info("tunnel connected")
 
@@ -73,7 +73,7 @@ func (s *Server) handleTunnel(conn net.Conn) {
 	defer close(done)
 
 	for {
-		frame, err := protocol.ReadFrame(conn)
+		frame, err := transport.ReadFrame(conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				log.Error("read from tunnel", "err", err)
@@ -82,7 +82,7 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		}
 
 		switch frame.Type {
-		case protocol.TypeChannelData:
+		case transport.TypeChannelData:
 			if channel, ok := tunnel.Channel(frame.ChannelID); ok {
 				log.Debug("forwarding packet from tunnel to channel", "channelID", frame.ChannelID, "len", len(frame.Payload))
 				if _, err := channel.Conn.Write(frame.Payload); err != nil {
@@ -91,14 +91,14 @@ func (s *Server) handleTunnel(conn net.Conn) {
 			} else {
 				log.Warn("received data for unknown channel", "channelID", frame.ChannelID)
 			}
-		case protocol.TypeChannelClose:
+		case transport.TypeChannelClose:
 			if channel, ok := tunnel.UnregisterChannel(frame.ChannelID); ok {
 				log.Info("received ChannelClose, closing channel", "channelID", frame.ChannelID)
 				if err := channel.Conn.Close(); err != nil {
 					log.Error("close channel connection", "channelID", frame.ChannelID, "err", err)
 				}
 			}
-		case protocol.TypePong:
+		case transport.TypePong:
 			log.Debug("received pong")
 		}
 	}
@@ -131,7 +131,7 @@ func (s *Server) handlePublicConnection(conn net.Conn) {
 		return
 	}
 
-	channel := protocol.NewChannel(s.prevChannelID.Add(1), conn)
+	channel := transport.NewChannel(s.prevChannelID.Add(1), conn)
 	tunnel.RegisterChannel(channel.ID, channel)
 
 	slog.Info("opened new channel", "channelID", channel.ID, "from", conn.RemoteAddr().String())
