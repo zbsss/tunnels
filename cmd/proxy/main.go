@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,7 +21,38 @@ type Proxy struct {
 	tunnelAddr string
 
 	prevChannelID atomic.Uint32
-	tunnel        atomic.Pointer[transport.Tunnel]
+
+	mu      sync.Mutex
+	tunnels []*transport.Tunnel
+	// Use for round-robin distribution of requests across tunnels
+	nextTunnelIdx int
+}
+
+func (p *Proxy) pickTunnel() *transport.Tunnel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.tunnels) == 0 {
+		return nil
+	}
+
+	idx := (p.nextTunnelIdx + 1) % len(p.tunnels)
+	p.nextTunnelIdx = idx
+	return p.tunnels[idx]
+}
+
+func (p *Proxy) addTunnel(t *transport.Tunnel) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tunnels = append(p.tunnels, t)
+}
+
+func (p *Proxy) removeTunnel(t *transport.Tunnel) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i := slices.Index(p.tunnels, t); i != -1 {
+		p.tunnels = slices.Delete(p.tunnels, i, i+1)
+	}
 }
 
 func (p *Proxy) listenTunnel() {
@@ -46,11 +79,11 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 	log := slog.With("component", "tunnel", "agentAddr", conn.RemoteAddr().String())
 
 	tunnel := transport.NewTunnel(conn)
-	p.tunnel.Store(tunnel)
+	p.addTunnel(tunnel)
 	log.Info("tunnel established")
 
 	defer func() {
-		p.tunnel.Store(nil)
+		p.removeTunnel(tunnel)
 		tunnel.Close()
 		log.Info("tunnel closed")
 	}()
@@ -126,15 +159,16 @@ func (p *Proxy) listenPublic() {
 }
 
 func (p *Proxy) handlePublicConnection(conn net.Conn) {
-	tunnel := p.tunnel.Load()
+	tunnel := p.pickTunnel()
 	if tunnel == nil {
 		slog.Warn("rejected connection, no tunnel available", "clientAddr", conn.RemoteAddr().String())
 		conn.Close()
 		return
 	}
 
+	// TODO: i need this value to be per tunnel
 	channel := transport.NewChannel(p.prevChannelID.Add(1), conn)
-	tunnel.RegisterChannel(channel.ID, channel)
+	tunnel.RegisterChannel(channel)
 
 	log := slog.With("component", "channel", "channelID", channel.ID, "clientAddr", conn.RemoteAddr().String())
 	log.Info("channel opened for public connection")
