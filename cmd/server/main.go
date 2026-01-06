@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,9 +20,6 @@ type Server struct {
 
 	prevStreamID atomic.Uint32
 	tunnel       atomic.Pointer[protocol.Tunnel]
-
-	// map from StreamID to protocol.Stream
-	streams sync.Map
 }
 
 func (s *Server) listenTunnel() {
@@ -48,6 +44,12 @@ func (s *Server) listenTunnel() {
 func (s *Server) handleTunnel(conn net.Conn) {
 	tunnel := protocol.NewTunnel(conn)
 	s.tunnel.Store(tunnel)
+	defer func() {
+		s.tunnel.Store(nil)
+		tunnel.Close() // Closes connection and all streams
+		slog.Info("tunnel disconnected")
+	}()
+
 	slog.Info("tunnel connected", "from", conn.RemoteAddr().String())
 
 	// keep alive ping-pong
@@ -59,17 +61,14 @@ func (s *Server) handleTunnel(conn net.Conn) {
 				return
 			case <-time.After(30 * time.Second):
 				slog.Debug("sending ping")
-				err := tunnel.Write(protocol.Frame{
-					Type:     protocol.TypePing,
-					StreamID: 0,
-				})
-				if err != nil {
-					slog.Error("write ping", "err", err)
-					continue
+				if err := tunnel.SendPing(); err != nil {
+					slog.Error("write ping failed, stopping keepalive", "err", err)
+					return
 				}
 			}
 		}
 	}()
+	defer close(done)
 
 	for {
 		frame, err := protocol.ReadFrame(conn)
@@ -77,30 +76,22 @@ func (s *Server) handleTunnel(conn net.Conn) {
 			if !errors.Is(err, io.EOF) {
 				slog.Error("read from tunnel", "err", err)
 			}
-
-			s.tunnel.Store(nil)
-			// TODO: if there are open streams should we close them?
-
-			close(done)
-			slog.Info("tunnel disconnected")
 			return
 		}
 
 		switch frame.Type {
 		case protocol.TypeStreamData:
-			if conn, ok := s.streams.Load(frame.StreamID); ok {
+			if stream, ok := tunnel.Stream(frame.StreamID); ok {
 				slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-				_, err := conn.(*protocol.Stream).Write(frame.Payload)
-				if err != nil {
+				if _, err := stream.Write(frame.Payload); err != nil {
 					slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
 				}
 			} else {
 				slog.Warn("received data for unknown stream", "streamID", frame.StreamID)
 			}
 		case protocol.TypeStreamClose:
-			if st, ok := s.streams.LoadAndDelete(frame.StreamID); ok {
-				slog.Debug("received StreamClose, closing stream...", "streamID", frame.StreamID)
-				stream := st.(*protocol.Stream)
+			if stream, ok := tunnel.UnregisterStream(frame.StreamID); ok {
+				slog.Debug("received StreamClose, closing stream", "streamID", frame.StreamID)
 				if err := stream.Close(); err != nil {
 					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
 				}
@@ -131,21 +122,17 @@ func (s *Server) listenPublic() {
 }
 
 func (s *Server) handlePublic(conn net.Conn) {
-	defer conn.Close()
-
 	tunnel := s.tunnel.Load()
 	if tunnel == nil {
 		slog.Error("no tunnel available")
+		conn.Close()
 		return
 	}
 
 	stream := protocol.NewStream(s.prevStreamID.Add(1), conn)
-	s.streams.Store(stream.ID, stream)
-	defer s.streams.Delete(stream.ID)
+	tunnel.RegisterStream(stream.ID, stream)
 
-	log := slog.With("streamID", stream.ID)
-	log.Info("opened new stream")
-
+	slog.Info("opened new stream", "streamID", stream.ID, "from", conn.RemoteAddr().String())
 	protocol.ForwardToTunnel(stream, tunnel)
 }
 

@@ -24,7 +24,8 @@ type Frame struct {
 	Payload  []byte
 }
 
-func WriteFrame(w io.Writer, f Frame) error {
+// TODO: should we limit max payload size?
+func writeFrame(w io.Writer, f Frame) error {
 	header := make([]byte, HeaderSize)
 	header[0] = f.Type
 	binary.BigEndian.PutUint32(header[1:5], f.StreamID)
@@ -43,6 +44,8 @@ func WriteFrame(w io.Writer, f Frame) error {
 	return nil
 }
 
+// TODO: make this private, and use Tunnel.Read
+// TODO: should we limit max payload size?
 func ReadFrame(r io.Reader) (Frame, error) {
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {

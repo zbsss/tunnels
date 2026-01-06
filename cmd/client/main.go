@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -17,8 +16,6 @@ type Client struct {
 	destAddr   string
 
 	tunnel *protocol.Tunnel
-
-	streams sync.Map
 }
 
 func (c *Client) run() error {
@@ -26,8 +23,8 @@ func (c *Client) run() error {
 	if err != nil {
 		return errors.Wrap(err, "dial tunnel")
 	}
-	defer conn.Close()
 	c.tunnel = protocol.NewTunnel(conn)
+	defer c.tunnel.Close()
 
 	slog.Info("forwarding ready", "from", c.serverAddr, "to", c.destAddr)
 
@@ -40,7 +37,7 @@ func (c *Client) run() error {
 		switch frame.Type {
 		case protocol.TypeStreamData:
 			// forward payload to destination server
-			stream, ok := c.streams.Load(frame.StreamID)
+			stream, ok := c.tunnel.Stream(frame.StreamID)
 			if !ok {
 				stream, err = c.openStream(frame.StreamID)
 				if err != nil {
@@ -48,20 +45,17 @@ func (c *Client) run() error {
 				}
 			}
 			slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-			_, err := stream.(*protocol.Stream).Write(frame.Payload)
-			if err != nil {
+			if _, err := stream.Write(frame.Payload); err != nil {
 				slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
 			}
 		case protocol.TypePing:
 			slog.Debug("received ping")
-			c.tunnel.Write(protocol.Frame{
-				Type:     protocol.TypePong,
-				StreamID: frame.StreamID,
-			})
+			if err := c.tunnel.SendPong(); err != nil {
+				slog.Error("write pong", "err", err)
+			}
 		case protocol.TypeStreamClose:
-			if st, ok := c.streams.LoadAndDelete(frame.StreamID); ok {
-				slog.Debug("received StreamClose, closing stream...", "streamID", frame.StreamID)
-				stream := st.(*protocol.Stream)
+			if stream, ok := c.tunnel.UnregisterStream(frame.StreamID); ok {
+				slog.Debug("received StreamClose, closing stream", "streamID", frame.StreamID)
 				if err := stream.Close(); err != nil {
 					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
 				}
@@ -79,13 +73,10 @@ func (c *Client) openStream(streamID uint32) (*protocol.Stream, error) {
 	}
 
 	stream := protocol.NewStream(streamID, destConn)
-	c.streams.Store(streamID, stream)
+	c.tunnel.RegisterStream(streamID, stream)
 	log.Info("opened new stream")
 
-	go func() {
-		protocol.ForwardToTunnel(stream, c.tunnel)
-		c.streams.Delete(streamID)
-	}()
+	go protocol.ForwardToTunnel(stream, c.tunnel)
 
 	return stream, nil
 }
