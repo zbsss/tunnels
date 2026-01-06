@@ -24,9 +24,14 @@ func (c *Client) run() error {
 		return errors.Wrap(err, "dial tunnel")
 	}
 	c.tunnel = protocol.NewTunnel(conn)
-	defer c.tunnel.Close()
 
-	slog.Info("forwarding ready", "from", c.serverAddr, "to", c.destAddr)
+	log := slog.With("tunnelRemote", conn.RemoteAddr().String())
+	log.Info("tunnel connected")
+
+	defer func() {
+		c.tunnel.Close()
+		log.Info("tunnel disconnected")
+	}()
 
 	for {
 		frame, err := protocol.ReadFrame(conn)
@@ -35,50 +40,48 @@ func (c *Client) run() error {
 		}
 
 		switch frame.Type {
-		case protocol.TypeStreamData:
+		case protocol.TypeChannelData:
 			// forward payload to destination server
-			stream, ok := c.tunnel.Stream(frame.StreamID)
+			channel, ok := c.tunnel.Channel(frame.ChannelID)
 			if !ok {
-				stream, err = c.openStream(frame.StreamID)
+				channel, err = c.openBackendChannel(frame.ChannelID)
 				if err != nil {
-					return errors.Wrapf(err, "open stream %d", frame.StreamID)
+					return errors.Wrapf(err, "open channel %d", frame.ChannelID)
 				}
 			}
-			slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-			if _, err := stream.Write(frame.Payload); err != nil {
-				slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
+			log.Debug("forwarding packet from tunnel to channel", "channelID", frame.ChannelID, "len", len(frame.Payload))
+			if _, err := channel.Conn.Write(frame.Payload); err != nil {
+				log.Error("write to channel", "channelID", frame.ChannelID, "err", err)
 			}
 		case protocol.TypePing:
-			slog.Debug("received ping")
+			log.Debug("received ping")
 			if err := c.tunnel.SendPong(); err != nil {
-				slog.Error("write pong", "err", err)
+				log.Error("write pong", "err", err)
 			}
-		case protocol.TypeStreamClose:
-			if stream, ok := c.tunnel.UnregisterStream(frame.StreamID); ok {
-				slog.Debug("received StreamClose, closing stream", "streamID", frame.StreamID)
-				if err := stream.Close(); err != nil {
-					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
+		case protocol.TypeChannelClose:
+			if channel, ok := c.tunnel.UnregisterChannel(frame.ChannelID); ok {
+				log.Info("received ChannelClose, closing channel", "channelID", frame.ChannelID)
+				if err := channel.Conn.Close(); err != nil {
+					log.Error("close channel", "channelID", frame.ChannelID, "err", err)
 				}
 			}
 		}
 	}
 }
 
-func (c *Client) openStream(streamID uint32) (*protocol.Stream, error) {
-	log := slog.With("streamID", streamID)
-
-	destConn, err := net.Dial("tcp", c.destAddr)
+func (c *Client) openBackendChannel(channelID uint32) (*protocol.Channel, error) {
+	backendConn, err := net.Dial("tcp", c.destAddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "dial dest")
 	}
 
-	stream := protocol.NewStream(streamID, destConn)
-	c.tunnel.RegisterStream(streamID, stream)
-	log.Info("opened new stream")
+	channel := protocol.NewChannel(channelID, backendConn)
+	c.tunnel.RegisterChannel(channelID, channel)
+	slog.Info("opened new channel", "channelID", channelID, "to", backendConn.RemoteAddr().String())
 
-	go protocol.ForwardToTunnel(stream, c.tunnel)
+	go channel.RelayThrough(c.tunnel)
 
-	return stream, nil
+	return channel, nil
 }
 
 func main() {

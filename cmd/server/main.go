@@ -18,8 +18,8 @@ type Server struct {
 	publicAddr string
 	tunnelAddr string
 
-	prevStreamID atomic.Uint32
-	tunnel       atomic.Pointer[protocol.Tunnel]
+	prevChannelID atomic.Uint32
+	tunnel        atomic.Pointer[protocol.Tunnel]
 }
 
 func (s *Server) listenTunnel() {
@@ -42,15 +42,17 @@ func (s *Server) listenTunnel() {
 }
 
 func (s *Server) handleTunnel(conn net.Conn) {
+	log := slog.With("tunnelRemote", conn.RemoteAddr().String())
+
 	tunnel := protocol.NewTunnel(conn)
 	s.tunnel.Store(tunnel)
+	log.Info("tunnel connected")
+
 	defer func() {
 		s.tunnel.Store(nil)
-		tunnel.Close() // Closes connection and all streams
-		slog.Info("tunnel disconnected")
+		tunnel.Close()
+		log.Info("tunnel disconnected")
 	}()
-
-	slog.Info("tunnel connected", "from", conn.RemoteAddr().String())
 
 	// keep alive ping-pong
 	done := make(chan struct{})
@@ -60,9 +62,9 @@ func (s *Server) handleTunnel(conn net.Conn) {
 			case <-done:
 				return
 			case <-time.After(30 * time.Second):
-				slog.Debug("sending ping")
+				log.Debug("sending ping")
 				if err := tunnel.SendPing(); err != nil {
-					slog.Error("write ping failed, stopping keepalive", "err", err)
+					log.Error("write ping failed, stopping keepalive", "err", err)
 					return
 				}
 			}
@@ -74,30 +76,30 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		frame, err := protocol.ReadFrame(conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				slog.Error("read from tunnel", "err", err)
+				log.Error("read from tunnel", "err", err)
 			}
 			return
 		}
 
 		switch frame.Type {
-		case protocol.TypeStreamData:
-			if stream, ok := tunnel.Stream(frame.StreamID); ok {
-				slog.Debug("forwarding packet from tunnel to stream", "streamID", frame.StreamID, "len", len(frame.Payload))
-				if _, err := stream.Write(frame.Payload); err != nil {
-					slog.Error("write to stream", "streamID", frame.StreamID, "err", err)
+		case protocol.TypeChannelData:
+			if channel, ok := tunnel.Channel(frame.ChannelID); ok {
+				log.Debug("forwarding packet from tunnel to channel", "channelID", frame.ChannelID, "len", len(frame.Payload))
+				if _, err := channel.Conn.Write(frame.Payload); err != nil {
+					log.Error("write to channel", "channelID", frame.ChannelID, "err", err)
 				}
 			} else {
-				slog.Warn("received data for unknown stream", "streamID", frame.StreamID)
+				log.Warn("received data for unknown channel", "channelID", frame.ChannelID)
 			}
-		case protocol.TypeStreamClose:
-			if stream, ok := tunnel.UnregisterStream(frame.StreamID); ok {
-				slog.Debug("received StreamClose, closing stream", "streamID", frame.StreamID)
-				if err := stream.Close(); err != nil {
-					slog.Error("close stream connection", "streamID", frame.StreamID, "err", err)
+		case protocol.TypeChannelClose:
+			if channel, ok := tunnel.UnregisterChannel(frame.ChannelID); ok {
+				log.Info("received ChannelClose, closing channel", "channelID", frame.ChannelID)
+				if err := channel.Conn.Close(); err != nil {
+					log.Error("close channel connection", "channelID", frame.ChannelID, "err", err)
 				}
 			}
 		case protocol.TypePong:
-			slog.Debug("received pong")
+			log.Debug("received pong")
 		}
 	}
 }
@@ -117,11 +119,11 @@ func (s *Server) listenPublic() {
 			continue
 		}
 
-		go s.handlePublic(conn)
+		go s.handlePublicConnection(conn)
 	}
 }
 
-func (s *Server) handlePublic(conn net.Conn) {
+func (s *Server) handlePublicConnection(conn net.Conn) {
 	tunnel := s.tunnel.Load()
 	if tunnel == nil {
 		slog.Error("no tunnel available")
@@ -129,11 +131,11 @@ func (s *Server) handlePublic(conn net.Conn) {
 		return
 	}
 
-	stream := protocol.NewStream(s.prevStreamID.Add(1), conn)
-	tunnel.RegisterStream(stream.ID, stream)
+	channel := protocol.NewChannel(s.prevChannelID.Add(1), conn)
+	tunnel.RegisterChannel(channel.ID, channel)
 
-	slog.Info("opened new stream", "streamID", stream.ID, "from", conn.RemoteAddr().String())
-	protocol.ForwardToTunnel(stream, tunnel)
+	slog.Info("opened new channel", "channelID", channel.ID, "from", conn.RemoteAddr().String())
+	channel.RelayThrough(tunnel)
 }
 
 func main() {

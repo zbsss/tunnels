@@ -8,10 +8,10 @@ import (
 )
 
 const (
-	TypeStreamData  = 'd'
-	TypeStreamClose = 'c'
-	TypePing        = 'i'
-	TypePong        = 'o'
+	TypeChannelData  = 'd'
+	TypeChannelClose = 'c'
+	TypePing         = 'i'
+	TypePong         = 'o'
 )
 
 const HeaderSize = 9
@@ -19,16 +19,16 @@ const HeaderSize = 9
 // Type     │ ID       │ Length   │ Payload
 // 1 byte   │ 4 bytes  │ 4 bytes  │ (Length bytes)
 type Frame struct {
-	Type     byte
-	StreamID uint32
-	Payload  []byte
+	Type      byte
+	ChannelID uint32
+	Payload   []byte
 }
 
 // TODO: should we limit max payload size?
 func writeFrame(w io.Writer, f Frame) error {
 	header := make([]byte, HeaderSize)
 	header[0] = f.Type
-	binary.BigEndian.PutUint32(header[1:5], f.StreamID)
+	binary.BigEndian.PutUint32(header[1:5], f.ChannelID)
 	binary.BigEndian.PutUint32(header[5:9], uint32(len(f.Payload)))
 
 	if _, err := w.Write(header); err != nil {
@@ -53,8 +53,8 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 
 	f := Frame{
-		Type:     header[0],
-		StreamID: binary.BigEndian.Uint32(header[1:5]),
+		Type:      header[0],
+		ChannelID: binary.BigEndian.Uint32(header[1:5]),
 	}
 
 	length := binary.BigEndian.Uint32(header[5:9])
