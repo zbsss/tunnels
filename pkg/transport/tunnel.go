@@ -1,7 +1,7 @@
 // Package transport implements a multiplexed tunneling protocol.
 //
 // Architecture:
-//   - Tunnel: A persistent TCP connection between client and server that carries
+//   - Tunnel: A persistent TCP connection between Proxy and Agent that carries
 //     multiple multiplexed channels.
 //   - Channel: A logical bidirectional stream within a tunnel, identified by a
 //     unique ChannelID. Each channel proxies one end-to-end connection.
@@ -9,7 +9,7 @@
 //
 // Flow:
 //
-//	Public Client → Server Channel → Tunnel → Client Channel → Backend Service
+//	Public Client → Proxy Channel → Tunnel → Agent Channel → Backend Service
 //
 // This design is similar to SSH port forwarding, where a single control connection
 // (tunnel) carries multiple forwarded connections (channels).

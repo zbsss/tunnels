@@ -14,7 +14,7 @@ import (
 	"github.com/zbsss/tunnels/pkg/transport"
 )
 
-type Server struct {
+type Proxy struct {
 	publicAddr string
 	tunnelAddr string
 
@@ -22,36 +22,37 @@ type Server struct {
 	tunnel        atomic.Pointer[transport.Tunnel]
 }
 
-func (s *Server) listenTunnel() {
-	lis, err := net.Listen("tcp", s.tunnelAddr)
+func (p *Proxy) listenTunnel() {
+	lis, err := net.Listen("tcp", p.tunnelAddr)
 	if err != nil {
 		log.Fatalf("tunnel listen: %+v", err)
 	}
 
 	defer lis.Close()
+	slog.Info("listening for tunnel connections", "listenAddr", p.tunnelAddr)
 
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
-			slog.Error("tunnel accept", "err", err)
+			slog.Error("failed to accept tunnel connection", "err", err)
 			continue
 		}
 
-		go s.handleTunnel(conn)
+		go p.handleTunnel(conn)
 	}
 }
 
-func (s *Server) handleTunnel(conn net.Conn) {
-	log := slog.With("tunnelRemote", conn.RemoteAddr().String())
+func (p *Proxy) handleTunnel(conn net.Conn) {
+	log := slog.With("component", "tunnel", "agentAddr", conn.RemoteAddr().String())
 
 	tunnel := transport.NewTunnel(conn)
-	s.tunnel.Store(tunnel)
-	log.Info("tunnel connected")
+	p.tunnel.Store(tunnel)
+	log.Info("tunnel established")
 
 	defer func() {
-		s.tunnel.Store(nil)
+		p.tunnel.Store(nil)
 		tunnel.Close()
-		log.Info("tunnel disconnected")
+		log.Info("tunnel closed")
 	}()
 
 	// keep alive ping-pong
@@ -62,9 +63,9 @@ func (s *Server) handleTunnel(conn net.Conn) {
 			case <-done:
 				return
 			case <-time.After(30 * time.Second):
-				log.Debug("sending ping")
+				log.Debug("sending keepalive ping")
 				if err := tunnel.SendPing(); err != nil {
-					log.Error("write ping failed, stopping keepalive", "err", err)
+					log.Error("failed to send keepalive ping", "err", err)
 					return
 				}
 			}
@@ -76,7 +77,7 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		frame, err := transport.ReadFrame(conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Error("read from tunnel", "err", err)
+				log.Error("failed to read frame from tunnel", "err", err)
 			}
 			return
 		}
@@ -84,57 +85,59 @@ func (s *Server) handleTunnel(conn net.Conn) {
 		switch frame.Type {
 		case transport.TypeChannelData:
 			if channel, ok := tunnel.Channel(frame.ChannelID); ok {
-				log.Debug("forwarding packet from tunnel to channel", "channelID", frame.ChannelID, "len", len(frame.Payload))
+				log.Debug("forwarding data tunnel -> client", "channelID", frame.ChannelID, "bytes", len(frame.Payload))
 				if _, err := channel.Conn.Write(frame.Payload); err != nil {
-					log.Error("write to channel", "channelID", frame.ChannelID, "err", err)
+					log.Error("failed to write to channel", "channelID", frame.ChannelID, "err", err)
 				}
 			} else {
 				log.Warn("received data for unknown channel", "channelID", frame.ChannelID)
 			}
 		case transport.TypeChannelClose:
 			if channel, ok := tunnel.UnregisterChannel(frame.ChannelID); ok {
-				log.Info("received ChannelClose, closing channel", "channelID", frame.ChannelID)
+				log.Info("closing channel on remote request", "channelID", frame.ChannelID)
 				if err := channel.Conn.Close(); err != nil {
-					log.Error("close channel connection", "channelID", frame.ChannelID, "err", err)
+					log.Error("failed to close channel connection", "channelID", frame.ChannelID, "err", err)
 				}
 			}
 		case transport.TypePong:
-			log.Debug("received pong")
+			log.Debug("received keepalive pong")
 		}
 	}
 }
 
-func (s *Server) listenPublic() {
-	lis, err := net.Listen("tcp", s.publicAddr)
+func (p *Proxy) listenPublic() {
+	lis, err := net.Listen("tcp", p.publicAddr)
 	if err != nil {
 		log.Fatalf("public listen: %+v", err)
 	}
 
 	defer lis.Close()
+	slog.Info("listening for public connections", "listenAddr", p.publicAddr)
 
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
-			slog.Error("public accept", "err", err)
+			slog.Error("failed to accept public connection", "err", err)
 			continue
 		}
 
-		go s.handlePublicConnection(conn)
+		go p.handlePublicConnection(conn)
 	}
 }
 
-func (s *Server) handlePublicConnection(conn net.Conn) {
-	tunnel := s.tunnel.Load()
+func (p *Proxy) handlePublicConnection(conn net.Conn) {
+	tunnel := p.tunnel.Load()
 	if tunnel == nil {
-		slog.Error("no tunnel available")
+		slog.Warn("rejected connection, no tunnel available", "clientAddr", conn.RemoteAddr().String())
 		conn.Close()
 		return
 	}
 
-	channel := transport.NewChannel(s.prevChannelID.Add(1), conn)
+	channel := transport.NewChannel(p.prevChannelID.Add(1), conn)
 	tunnel.RegisterChannel(channel.ID, channel)
 
-	slog.Info("opened new channel", "channelID", channel.ID, "from", conn.RemoteAddr().String())
+	log := slog.With("component", "channel", "channelID", channel.ID, "clientAddr", conn.RemoteAddr().String())
+	log.Info("channel opened for public connection")
 	channel.RelayThrough(tunnel)
 }
 
@@ -152,18 +155,17 @@ func main() {
 		Level: level,
 	})))
 
-	server := &Server{
+	proxy := &Proxy{
 		publicAddr: *publicAddr,
 		tunnelAddr: *tunnelAddr,
 	}
 
-	// Server must accept two types of connections
-	// 1. From the Client (creating the tunnel)
-	// 2. From the Users (public)
-	// These should be two different ports
+	// Proxy must accept two types of connections
+	// 1. From the Agent (creating the tunnel)
+	// 2. From the Clients (public)
 
-	go server.listenTunnel()
-	server.listenPublic()
+	go proxy.listenTunnel()
+	proxy.listenPublic()
 
 	// TODO: handle graceful shutdowns
 }
