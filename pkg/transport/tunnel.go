@@ -98,15 +98,17 @@ func (t *Tunnel) Serve(ctx context.Context, handler func(frame Frame)) {
 			done := make(chan struct{})
 			t.channelDone.Store(frame.ChannelID, done)
 
-			go func(done chan struct{}, q chan Frame) {
-				select {
-				case <-done:
-					return
-				case frame, ok := <-queue:
-					if !ok {
+			go func(d chan struct{}, q chan Frame) {
+				for {
+					select {
+					case <-d:
 						return
+					case frame, ok := <-q:
+						if !ok {
+							return
+						}
+						handler(frame)
 					}
-					handler(frame)
 				}
 			}(done, queue)
 		}
