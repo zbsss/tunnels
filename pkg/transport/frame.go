@@ -44,9 +44,8 @@ func writeFrame(w io.Writer, f Frame) error {
 	return nil
 }
 
-// TODO: make this private, and use Tunnel.Read
 // TODO: should we limit max payload size?
-func ReadFrame(r io.Reader) (Frame, error) {
+func readFrame(r io.Reader) (Frame, error) {
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return Frame{}, errors.Wrap(err, "read header")

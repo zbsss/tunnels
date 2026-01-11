@@ -1,9 +1,8 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
-	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -101,14 +100,16 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 		tunnel.Log().Info("tunnel closed")
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// keep alive ping-pong
-	done := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case <-done:
+			case <-ctx.Done():
 				return
-			case <-time.After(30 * time.Second):
+			case <-time.After(transport.TunnelIdleTimeout / 2):
 				tunnel.Log().Debug("sending keepalive ping")
 				if err := tunnel.SendPing(); err != nil {
 					tunnel.Log().Error("failed to send keepalive ping", "err", err)
@@ -117,19 +118,15 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 			}
 		}
 	}()
-	defer close(done)
+
+	go tunnel.WatchIdleTimeout(ctx)
 
 	for {
-		// TODO: this should be moved to tunnel.Read(), this internally should handle retries
-		// and should return a custom tunnel closed error
-		frame, err := transport.ReadFrame(conn)
+		frame, err := tunnel.Read()
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if !transport.IsExpectedCloseErr(err) {
 				tunnel.Log().Error("failed to read frame from tunnel", "err", err)
 			}
-			// TODO: should we close tunnel if single read attempt fails?
-			// we should only close tunnel if the connection was closed.
-			// how to know if it's closed? io.EOF or something else?
 			return
 		}
 

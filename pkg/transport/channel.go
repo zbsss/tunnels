@@ -1,8 +1,6 @@
 package transport
 
 import (
-	"errors"
-	"io"
 	"log/slog"
 	"net"
 )
@@ -81,7 +79,7 @@ func (ch *Channel) RelayThrough(tunnel *Tunnel) {
 		}
 		if err != nil {
 			// Don't log EOF or "connection closed" errors - these are expected
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			if !IsExpectedCloseErr(err) {
 				ch.Log().Error("failed to read from connection", "err", err)
 			}
 			return

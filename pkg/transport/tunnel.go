@@ -16,9 +16,12 @@
 package transport
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type options struct {
@@ -40,12 +43,18 @@ func WithLogger(log *slog.Logger) Option {
 	}
 }
 
+const (
+	TunnelIdleTimeout = 30 * time.Second
+)
+
 type Tunnel struct {
 	log *slog.Logger
 
 	mu       sync.Mutex
 	conn     net.Conn
 	channels sync.Map // map from ChannelID to *Channel
+
+	lastActivity atomic.Value
 }
 
 func NewTunnel(conn net.Conn, opts ...Option) *Tunnel {
@@ -57,6 +66,36 @@ func NewTunnel(conn net.Conn, opts ...Option) *Tunnel {
 	return &Tunnel{
 		conn: conn,
 		log:  o.log.With("component", "tunnel", "tunnelLocal", conn.LocalAddr(), "tunnelRemote", conn.RemoteAddr()),
+	}
+}
+
+func (t *Tunnel) Read() (Frame, error) {
+	defer t.refreshActivity()
+	return readFrame(t.conn)
+}
+
+func (t *Tunnel) refreshActivity() {
+	t.lastActivity.Swap(time.Now())
+}
+
+func (t *Tunnel) WatchIdleTimeout(ctx context.Context) {
+	ticker := time.NewTicker(TunnelIdleTimeout / 2)
+	defer ticker.Stop()
+
+	t.refreshActivity()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			last := t.lastActivity.Load().(time.Time)
+			if time.Since(last) > TunnelIdleTimeout {
+				t.Log().Error("tunnel idle timeout, closing")
+				t.Close()
+				return
+			}
+		}
 	}
 }
 

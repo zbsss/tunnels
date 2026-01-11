@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net"
@@ -32,10 +33,16 @@ func (a *Agent) run() error {
 		a.tunnel.Log().Info("tunnel closed")
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.tunnel.WatchIdleTimeout(ctx)
+
 	for {
-		frame, err := transport.ReadFrame(conn)
+		frame, err := a.tunnel.Read()
 		if err != nil {
-			// TODO: should it fail if single read attempt fails?
+			if transport.IsExpectedCloseErr(err) {
+				return nil
+			}
 			return errors.Wrap(err, "read from tunnel")
 		}
 		go a.processFrame(&frame)
@@ -125,9 +132,7 @@ func main() {
 
 	for {
 		err := agent.run()
-		if err != nil {
-			slog.Error("tunnel connection lost, reconnecting in 5s", "err", err)
-			time.Sleep(5 * time.Second)
-		}
+		slog.Error("tunnel connection lost, reconnecting in 5s", "err", err)
+		time.Sleep(5 * time.Second)
 	}
 }
