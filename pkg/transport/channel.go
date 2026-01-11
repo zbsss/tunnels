@@ -79,7 +79,7 @@ func (ch *Channel) RelayThrough(tunnel *Tunnel) {
 		}
 		if err != nil {
 			// Don't log EOF or "connection closed" errors - these are expected
-			if !IsExpectedCloseErr(err) {
+			if !isExpectedCloseErr(err) {
 				ch.Log().Error("failed to read from connection", "err", err)
 			}
 			return

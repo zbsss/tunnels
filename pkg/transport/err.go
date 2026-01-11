@@ -6,6 +6,6 @@ import (
 	"net"
 )
 
-func IsExpectedCloseErr(err error) bool {
+func isExpectedCloseErr(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 }

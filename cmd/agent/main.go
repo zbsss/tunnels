@@ -35,21 +35,14 @@ func (a *Agent) run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.tunnel.WatchIdleTimeout(ctx)
 
-	for {
-		frame, err := a.tunnel.Read()
-		if err != nil {
-			if transport.IsExpectedCloseErr(err) {
-				return nil
-			}
-			return errors.Wrap(err, "read from tunnel")
-		}
-		go a.processFrame(&frame)
-	}
+	a.tunnel.Serve(ctx, a.processFrame)
+
+	// TODO: how to handle errors?
+	return nil
 }
 
-func (a *Agent) processFrame(frame *transport.Frame) {
+func (a *Agent) processFrame(frame transport.Frame) {
 	log := a.tunnel.Log().With("channelID", frame.ChannelID)
 
 	switch frame.Type {
@@ -110,7 +103,7 @@ func (a *Agent) openBackendChannel(channelID uint32) (*transport.Channel, error)
 }
 
 func main() {
-	debug := flag.Bool("debug", false, "enable debug logging")
+	debug := flag.Bool("debug", true, "enable debug logging")
 	proxyAddr := flag.String("proxy", ":8443", "tunnel proxy address")
 	backendAddr := flag.String("backend", ":42064", "backend service address")
 	flag.Parse()

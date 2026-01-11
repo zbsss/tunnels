@@ -119,22 +119,12 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 		}
 	}()
 
-	go tunnel.WatchIdleTimeout(ctx)
-
-	for {
-		frame, err := tunnel.Read()
-		if err != nil {
-			if !transport.IsExpectedCloseErr(err) {
-				tunnel.Log().Error("failed to read frame from tunnel", "err", err)
-			}
-			return
-		}
-
-		go processFrame(tunnel, &frame)
-	}
+	tunnel.Serve(ctx, func(frame transport.Frame) {
+		processFrame(tunnel, frame)
+	})
 }
 
-func processFrame(tunnel *transport.Tunnel, frame *transport.Frame) {
+func processFrame(tunnel *transport.Tunnel, frame transport.Frame) {
 	log := tunnel.Log().With("channelID", frame.ChannelID)
 	switch frame.Type {
 	case transport.TypeChannelData:
@@ -195,7 +185,7 @@ func (p *Proxy) handlePublicConnection(conn net.Conn) {
 }
 
 func main() {
-	debug := flag.Bool("debug", false, "enable debug logging")
+	debug := flag.Bool("debug", true, "enable debug logging")
 	publicAddr := flag.String("public", ":8080", "public listener address")
 	tunnelAddr := flag.String("tunnel", ":8443", "tunnel listener address")
 	flag.Parse()
