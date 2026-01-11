@@ -44,15 +44,17 @@ func WithLogger(log *slog.Logger) Option {
 }
 
 const (
-	TunnelIdleTimeout = 30 * time.Second
+	TunnelIdleTimeout   = 30 * time.Second
+	ChannelMaxQueueSize = 256
 )
 
 type Tunnel struct {
 	log *slog.Logger
 
-	mu       sync.Mutex
-	conn     net.Conn
-	channels sync.Map // map from ChannelID to *Channel
+	mu          sync.Mutex
+	conn        net.Conn
+	channels    sync.Map // map from ChannelID to *Channel
+	channelDone sync.Map // map from ChannelID to chan struct{}
 
 	lastActivity atomic.Value
 }
@@ -69,16 +71,51 @@ func NewTunnel(conn net.Conn, opts ...Option) *Tunnel {
 	}
 }
 
-func (t *Tunnel) Read() (Frame, error) {
-	defer t.refreshActivity()
-	return readFrame(t.conn)
+func (t *Tunnel) Serve(ctx context.Context, handler func(frame Frame)) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go t.watchIdleTimeout(ctx)
+
+	channelQueues := make(map[uint32]chan Frame)
+
+	t.Log().Debug("waiting for frames...")
+	for {
+		frame, err := t.read()
+		if err != nil {
+			if !isExpectedCloseErr(err) {
+				t.Log().Error("failed to read frame from tunnel", "err", err)
+			}
+			return
+		}
+
+		queue, exists := channelQueues[frame.ChannelID]
+		if !exists {
+			queue = make(chan Frame, ChannelMaxQueueSize)
+			channelQueues[frame.ChannelID] = queue
+
+			// These goroutines are stopped when tunnel.UnregisterChannel is called
+			done := make(chan struct{})
+			t.channelDone.Store(frame.ChannelID, done)
+
+			go func(done chan struct{}, q chan Frame) {
+				select {
+				case <-done:
+					return
+				case frame, ok := <-queue:
+					if !ok {
+						return
+					}
+					handler(frame)
+				}
+			}(done, queue)
+		}
+
+		queue <- frame
+	}
 }
 
-func (t *Tunnel) refreshActivity() {
-	t.lastActivity.Swap(time.Now())
-}
-
-func (t *Tunnel) WatchIdleTimeout(ctx context.Context) {
+func (t *Tunnel) watchIdleTimeout(ctx context.Context) {
 	ticker := time.NewTicker(TunnelIdleTimeout / 2)
 	defer ticker.Stop()
 
@@ -101,6 +138,15 @@ func (t *Tunnel) WatchIdleTimeout(ctx context.Context) {
 
 func (t *Tunnel) Log() *slog.Logger {
 	return t.log
+}
+
+func (t *Tunnel) read() (Frame, error) {
+	defer t.refreshActivity()
+	return readFrame(t.conn)
+}
+
+func (t *Tunnel) refreshActivity() {
+	t.lastActivity.Swap(time.Now())
 }
 
 // write is a thread-safe wrapper around writeFrame
@@ -135,6 +181,12 @@ func (t *Tunnel) UnregisterChannel(id uint32) (*Channel, bool) {
 	if !ok {
 		return nil, false
 	}
+
+	// signal to stop frame processor goroutine
+	if done, ok := t.channelDone.LoadAndDelete(id); ok {
+		close(done.(chan struct{}))
+	}
+
 	return val.(*Channel), true
 }
 
