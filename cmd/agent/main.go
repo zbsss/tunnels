@@ -36,10 +36,7 @@ func (a *Agent) run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	a.tunnel.Serve(ctx, a.processFrame)
-
-	// TODO: how to handle errors?
-	return nil
+	return a.tunnel.Serve(ctx, a.processFrame)
 }
 
 func (a *Agent) processFrame(frame transport.Frame) {

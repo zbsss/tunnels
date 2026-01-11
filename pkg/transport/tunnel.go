@@ -71,7 +71,7 @@ func NewTunnel(conn net.Conn, opts ...Option) *Tunnel {
 	}
 }
 
-func (t *Tunnel) Serve(ctx context.Context, handler func(frame Frame)) {
+func (t *Tunnel) Serve(ctx context.Context, handler func(frame Frame)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -79,14 +79,13 @@ func (t *Tunnel) Serve(ctx context.Context, handler func(frame Frame)) {
 
 	channelQueues := make(map[uint32]chan Frame)
 
-	t.Log().Debug("waiting for frames...")
 	for {
 		frame, err := t.read()
 		if err != nil {
 			if !isExpectedCloseErr(err) {
 				t.Log().Error("failed to read frame from tunnel", "err", err)
 			}
-			return
+			return err
 		}
 
 		queue, exists := channelQueues[frame.ChannelID]
@@ -184,7 +183,7 @@ func (t *Tunnel) UnregisterChannel(id uint32) (*Channel, bool) {
 		return nil, false
 	}
 
-	// signal to stop frame processor goroutine
+	// signal to stop frame handler goroutine
 	if done, ok := t.channelDone.LoadAndDelete(id); ok {
 		close(done.(chan struct{}))
 	}
