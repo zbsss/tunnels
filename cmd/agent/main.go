@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/zbsss/tunnels/internal/retry"
 	"github.com/zbsss/tunnels/pkg/transport"
 )
 
@@ -23,62 +24,78 @@ func (a *Agent) run() error {
 	if err != nil {
 		return errors.Wrap(err, "dial tunnel")
 	}
-	a.tunnel = transport.NewTunnel(conn)
-
-	tunnelLog := slog.With("component", "tunnel", "proxyAddr", a.proxyAddr, "backendAddr", a.backendAddr)
-	tunnelLog.Info("tunnel established")
+	a.tunnel = transport.NewTunnel(conn, transport.WithLogger(slog.With("proxyAddr", a.proxyAddr, "backendAddr", a.backendAddr)))
+	a.tunnel.Log().Info("tunnel established")
 
 	defer func() {
 		a.tunnel.Close()
-		tunnelLog.Info("tunnel closed")
+		a.tunnel.Log().Info("tunnel closed")
 	}()
 
 	for {
 		frame, err := transport.ReadFrame(conn)
 		if err != nil {
+			// TODO: should it fail if single read attempt fails?
 			return errors.Wrap(err, "read from tunnel")
 		}
+		go a.processFrame(&frame)
+	}
+}
 
-		switch frame.Type {
-		case transport.TypeChannelData:
-			channel, ok := a.tunnel.Channel(frame.ChannelID)
-			if !ok {
-				channel, err = a.openBackendChannel(frame.ChannelID)
+func (a *Agent) processFrame(frame *transport.Frame) {
+	log := a.tunnel.Log().With("channelID", frame.ChannelID)
+
+	switch frame.Type {
+	case transport.TypeChannelData:
+		channel, ok := a.tunnel.Channel(frame.ChannelID)
+		if !ok {
+			var err error
+			channel, err = a.openBackendChannel(frame.ChannelID)
+			if err != nil {
+				log.Error("failed to open connection to backend, sending channel close to tunnel", "err", err)
+				err = a.tunnel.SendClose(frame.ChannelID)
 				if err != nil {
-					return errors.Wrapf(err, "open channel %d", frame.ChannelID)
+					log.Error("failed to send channel close", "err", err)
 				}
+				return
 			}
-			tunnelLog.Debug("forwarding data tunnel -> backend", "channelID", frame.ChannelID, "bytes", len(frame.Payload))
-			if _, err := channel.Conn.Write(frame.Payload); err != nil {
-				tunnelLog.Error("failed to write to backend", "channelID", frame.ChannelID, "err", err)
-			}
-		case transport.TypePing:
-			tunnelLog.Debug("received keepalive ping")
-			if err := a.tunnel.SendPong(); err != nil {
-				tunnelLog.Error("failed to send keepalive pong", "err", err)
-			}
-		case transport.TypeChannelClose:
-			if channel, ok := a.tunnel.UnregisterChannel(frame.ChannelID); ok {
-				tunnelLog.Info("closing channel on remote request", "channelID", frame.ChannelID)
-				if err := channel.Conn.Close(); err != nil {
-					tunnelLog.Error("failed to close channel connection", "channelID", frame.ChannelID, "err", err)
-				}
+		}
+		log.Debug("forwarding data tunnel -> backend", "bytes", len(frame.Payload))
+		if _, err := channel.Conn.Write(frame.Payload); err != nil {
+			log.Error("failed to write to backend", "err", err)
+		}
+	case transport.TypePing:
+		log.Debug("received keepalive ping")
+		if err := a.tunnel.SendPong(); err != nil {
+			log.Error("failed to send keepalive pong", "err", err)
+		}
+	case transport.TypeChannelClose:
+		if channel, ok := a.tunnel.UnregisterChannel(frame.ChannelID); ok {
+			log.Info("closing channel on remote request", "channelID", frame.ChannelID)
+			if err := channel.Conn.Close(); err != nil {
+				log.Error("failed to close channel connection", "channelID", frame.ChannelID, "err", err)
 			}
 		}
 	}
 }
 
 func (a *Agent) openBackendChannel(channelID uint32) (*transport.Channel, error) {
-	backendConn, err := net.Dial("tcp", a.backendAddr)
+	var backendConn net.Conn
+	err := retry.Do(5, 10*time.Second, func() error {
+		var err error
+		backendConn, err = net.Dial("tcp", a.backendAddr)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, errors.Wrap(err, "dial backend")
+		return nil, errors.Wrapf(err, "open connection to backend %q", a.backendAddr)
 	}
 
-	channel := transport.NewChannel(channelID, backendConn)
+	channel := transport.NewChannel(channelID, backendConn, transport.WithLogger(a.tunnel.Log().With("backendAddr", a.backendAddr)))
 	a.tunnel.RegisterChannel(channel)
-
-	channelLog := slog.With("component", "channel", "channelID", channelID, "backendAddr", a.backendAddr)
-	channelLog.Info("channel opened to backend")
+	channel.Log().Info("channel opened to backend")
 
 	go channel.RelayThrough(a.tunnel)
 
@@ -86,7 +103,7 @@ func (a *Agent) openBackendChannel(channelID uint32) (*transport.Channel, error)
 }
 
 func main() {
-	debug := flag.Bool("debug", true, "enable debug logging")
+	debug := flag.Bool("debug", false, "enable debug logging")
 	proxyAddr := flag.String("proxy", ":8443", "tunnel proxy address")
 	backendAddr := flag.String("backend", ":42064", "backend service address")
 	flag.Parse()

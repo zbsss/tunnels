@@ -17,15 +17,27 @@ const (
 // On the Proxy side: wraps a connection from a public clients
 // On the Agent side: wraps a connection to the backend service
 type Channel struct {
+	log *slog.Logger
+
 	ID   uint32
 	Conn net.Conn
 }
 
-func NewChannel(id uint32, conn net.Conn) *Channel {
+func NewChannel(id uint32, conn net.Conn, opts ...Option) *Channel {
+	o := new(options).withDefaults()
+	for _, update := range opts {
+		update(o)
+	}
+
 	return &Channel{
 		ID:   id,
 		Conn: conn,
+		log:  o.log.With("component", "channel", "channelID", id, "channelConnAddr", conn.RemoteAddr().String()),
 	}
+}
+
+func (ch *Channel) Log() *slog.Logger {
+	return ch.log
 }
 
 // RelayThrough reads data from this channel's connection and forwards it
@@ -61,16 +73,16 @@ func (ch *Channel) RelayThrough(tunnel *Tunnel) {
 	for {
 		n, err := ch.Conn.Read(buf)
 		if n > 0 {
-			log.Debug("forwarding data channel -> tunnel", "bytes", n)
+			ch.Log().Debug("forwarding data channel -> tunnel", "bytes", n)
 			if wErr := tunnel.SendData(ch.ID, buf[:n]); wErr != nil {
-				log.Error("failed to send data to tunnel", "err", wErr)
+				ch.Log().Error("failed to send data to tunnel", "err", wErr)
 				return
 			}
 		}
 		if err != nil {
 			// Don't log EOF or "connection closed" errors - these are expected
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				log.Error("failed to read from connection", "err", err)
+				ch.Log().Error("failed to read from connection", "err", err)
 			}
 			return
 		}

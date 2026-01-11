@@ -91,16 +91,14 @@ func (p *Proxy) listenTunnel() {
 }
 
 func (p *Proxy) handleTunnel(conn net.Conn) {
-	log := slog.With("component", "tunnel", "agentAddr", conn.RemoteAddr().String())
-
 	tunnel := transport.NewTunnel(conn)
 	p.addTunnel(tunnel)
-	log.Info("tunnel established")
+	tunnel.Log().Info("tunnel established")
 
 	defer func() {
 		p.removeTunnel(tunnel)
 		tunnel.Close()
-		log.Info("tunnel closed")
+		tunnel.Log().Info("tunnel closed")
 	}()
 
 	// keep alive ping-pong
@@ -111,9 +109,9 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 			case <-done:
 				return
 			case <-time.After(30 * time.Second):
-				log.Debug("sending keepalive ping")
+				tunnel.Log().Debug("sending keepalive ping")
 				if err := tunnel.SendPing(); err != nil {
-					log.Error("failed to send keepalive ping", "err", err)
+					tunnel.Log().Error("failed to send keepalive ping", "err", err)
 					return
 				}
 			}
@@ -122,34 +120,44 @@ func (p *Proxy) handleTunnel(conn net.Conn) {
 	defer close(done)
 
 	for {
+		// TODO: this should be moved to tunnel.Read(), this internally should handle retries
+		// and should return a custom tunnel closed error
 		frame, err := transport.ReadFrame(conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Error("failed to read frame from tunnel", "err", err)
+				tunnel.Log().Error("failed to read frame from tunnel", "err", err)
 			}
+			// TODO: should we close tunnel if single read attempt fails?
+			// we should only close tunnel if the connection was closed.
+			// how to know if it's closed? io.EOF or something else?
 			return
 		}
 
-		switch frame.Type {
-		case transport.TypeChannelData:
-			if channel, ok := tunnel.Channel(frame.ChannelID); ok {
-				log.Debug("forwarding data tunnel -> client", "channelID", frame.ChannelID, "bytes", len(frame.Payload))
-				if _, err := channel.Conn.Write(frame.Payload); err != nil {
-					log.Error("failed to write to channel", "channelID", frame.ChannelID, "err", err)
-				}
-			} else {
-				log.Warn("received data for unknown channel", "channelID", frame.ChannelID)
+		go processFrame(tunnel, &frame)
+	}
+}
+
+func processFrame(tunnel *transport.Tunnel, frame *transport.Frame) {
+	log := tunnel.Log().With("channelID", frame.ChannelID)
+	switch frame.Type {
+	case transport.TypeChannelData:
+		if channel, ok := tunnel.Channel(frame.ChannelID); ok {
+			log.Debug("forwarding data tunnel -> client", "bytes", len(frame.Payload))
+			if _, err := channel.Conn.Write(frame.Payload); err != nil {
+				log.Error("failed to write to channel", "err", err)
 			}
-		case transport.TypeChannelClose:
-			if channel, ok := tunnel.UnregisterChannel(frame.ChannelID); ok {
-				log.Info("closing channel on remote request", "channelID", frame.ChannelID)
-				if err := channel.Conn.Close(); err != nil {
-					log.Error("failed to close channel connection", "channelID", frame.ChannelID, "err", err)
-				}
-			}
-		case transport.TypePong:
-			log.Debug("received keepalive pong")
+		} else {
+			log.Warn("received data for unknown channel")
 		}
+	case transport.TypeChannelClose:
+		if channel, ok := tunnel.UnregisterChannel(frame.ChannelID); ok {
+			log.Info("closing channel on remote request", "channelID", frame.ChannelID)
+			if err := channel.Conn.Close(); err != nil {
+				log.Error("failed to close channel connection", "channelID", frame.ChannelID, "err", err)
+			}
+		}
+	case transport.TypePong:
+		log.Debug("received keepalive pong")
 	}
 }
 
@@ -182,16 +190,15 @@ func (p *Proxy) handlePublicConnection(conn net.Conn) {
 	}
 
 	channelID := p.nextChannelID(tunnel)
-	channel := transport.NewChannel(channelID, conn)
+	channel := transport.NewChannel(channelID, conn, transport.WithLogger(tunnel.Log()))
 	tunnel.RegisterChannel(channel)
 
-	log := slog.With("component", "channel", "channelID", channel.ID, "clientAddr", conn.RemoteAddr().String())
-	log.Info("channel opened for public connection")
+	channel.Log().Info("channel opened for public connection")
 	channel.RelayThrough(tunnel)
 }
 
 func main() {
-	debug := flag.Bool("debug", true, "enable debug logging")
+	debug := flag.Bool("debug", false, "enable debug logging")
 	publicAddr := flag.String("public", ":8080", "public listener address")
 	tunnelAddr := flag.String("tunnel", ":8443", "tunnel listener address")
 	flag.Parse()

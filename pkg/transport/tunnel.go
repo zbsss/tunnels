@@ -16,20 +16,52 @@
 package transport
 
 import (
+	"log/slog"
 	"net"
 	"sync"
 )
 
+type options struct {
+	log *slog.Logger
+}
+
+func (o *options) withDefaults() *options {
+	if o.log == nil {
+		o.log = slog.Default()
+	}
+	return o
+}
+
+type Option func(p *options)
+
+func WithLogger(log *slog.Logger) Option {
+	return func(opts *options) {
+		opts.log = log
+	}
+}
+
 type Tunnel struct {
+	log *slog.Logger
+
 	mu       sync.Mutex
 	conn     net.Conn
 	channels sync.Map // map from ChannelID to *Channel
 }
 
-func NewTunnel(conn net.Conn) *Tunnel {
+func NewTunnel(conn net.Conn, opts ...Option) *Tunnel {
+	o := new(options).withDefaults()
+	for _, update := range opts {
+		update(o)
+	}
+
 	return &Tunnel{
 		conn: conn,
+		log:  o.log.With("component", "tunnel", "tunnelLocal", conn.LocalAddr(), "tunnelRemote", conn.RemoteAddr()),
 	}
+}
+
+func (t *Tunnel) Log() *slog.Logger {
+	return t.log
 }
 
 // write is a thread-safe wrapper around writeFrame
@@ -47,6 +79,7 @@ func (t *Tunnel) Close() error {
 		}
 		return true
 	})
+	t.channels.Clear()
 
 	return t.conn.Close()
 }
