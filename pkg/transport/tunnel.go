@@ -167,6 +167,14 @@ func (t *Tunnel) Close() error {
 	})
 	t.channels.Clear()
 
+	t.channelDone.Range(func(key, value any) bool {
+		if done, ok := value.(chan struct{}); ok {
+			close(done)
+		}
+		return true
+	})
+	t.channelDone.Clear()
+
 	return t.conn.Close()
 }
 
